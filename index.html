@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Bible Study Board</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260524ci" />
-    <link rel="stylesheet" href="./styles.css?v=20260527cb" />
+    <link rel="stylesheet" href="./styles.css?v=20260527cc" />
   </head>
   <body>
     <section id="loginView" class="login-view">
@@ -24,11 +24,11 @@
         <h1>Bible Study Board</h1>
         <label>
           <span>Login</span>
-          <input id="loginName" autocomplete="username" value="Login" />
+          <input id="loginName" autocomplete="username" />
         </label>
         <label>
           <span>Password</span>
-          <input id="loginPassword" type="password" autocomplete="current-password" value="Login" />
+          <input id="loginPassword" type="password" autocomplete="current-password" />
         </label>
         <div class="login-actions">
           <button class="primary" type="submit">Enter</button>
@@ -36,6 +36,29 @@
         </div>
         <p id="loginError" class="error"></p>
       </form>
+    </section>
+
+    <section id="adminView" class="admin-view" hidden>
+      <main class="admin-shell">
+        <header class="admin-top-strip">
+          <div class="board-heading">
+            <p class="kicker">Admin</p>
+            <h1>Accounts</h1>
+            <p class="muted">See board accounts, block access, and remove saved board data.</p>
+          </div>
+          <div class="top-actions">
+            <button id="adminRefreshButton" class="ghost-button" type="button">Refresh</button>
+            <button id="adminLogoutButton" class="ghost-button" type="button">Log out</button>
+          </div>
+        </header>
+        <section class="admin-content">
+          <div class="admin-note">
+            Full Firebase Authentication user deletion still has to be done in Firebase Console -> Authentication.
+          </div>
+          <p id="adminStatus" class="bible-status">Loading accounts...</p>
+          <div id="adminAccountList" class="admin-account-list"></div>
+        </section>
+      </main>
     </section>
 
     <section id="appView" class="app" hidden>
@@ -252,6 +275,6 @@
 
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="./bibles/manifest.js?v=20260524bx"></script>
-    <script src="./app.js?v=20260527ce"></script>
+    <script src="./app.js?v=20260527cg"></script>
   </body>
 </html>

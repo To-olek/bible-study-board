@@ -148,7 +148,121 @@ select:focus {
   box-shadow: var(--shadow);
 }
 
+.admin-view {
+  height: 100vh;
+  display: grid;
+  background:
+    linear-gradient(rgba(32, 35, 40, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(32, 35, 40, 0.045) 1px, transparent 1px),
+    var(--bg);
+  background-size: 28px 28px;
+}
+
+.admin-shell {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.admin-top-strip {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(16px);
+}
+
+.admin-content {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.admin-note {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.86);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.admin-account-list {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-account {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: var(--shadow);
+}
+
+.admin-account-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-account h3 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.1;
+}
+
+.admin-account-meta {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.admin-badges,
+.admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.admin-badge.blocked {
+  color: var(--red);
+  border-color: rgba(184, 74, 74, 0.25);
+  background: rgba(184, 74, 74, 0.06);
+}
+
 .login-card h1,
+.admin-top-strip h1,
 .top-strip h1,
 .panel-head h2,
 .inspector h2 {
@@ -264,7 +378,8 @@ select:focus {
   min-width: 150px;
 }
 
-.top-strip h1 {
+.top-strip h1,
+.admin-top-strip h1 {
   max-width: 48vw;
   overflow: hidden;
   text-overflow: ellipsis;

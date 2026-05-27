@@ -5,6 +5,10 @@
   const AUTH_SESSION_KEY = "bible-study-board-auth-session-v1";
   const USERS_KEY = "bible-study-board-users-v1";
   const FIREBASE_BOARD_COLLECTION = "userBoards";
+  const FIREBASE_PROFILE_COLLECTION = "userProfiles";
+  const FIREBASE_BLOCKED_COLLECTION = "blockedUsers";
+  const ADMIN_LOGIN = "admin_admin";
+  const ADMIN_PASSWORD = "admin_admin";
   const FIREBASE_SDK_VERSION = "12.13.0";
   const FIREBASE_CONFIG = {
     apiKey: "AIzaSyCI4tHyGeqt1-SZhoV7v7PlyN7eBk48luw",
@@ -98,6 +102,7 @@
   let remoteSavePromise = Promise.resolve();
   let applyingRemoteState = false;
   let imageBootPromise = null;
+  let adminAccounts = [];
 
   document.addEventListener("DOMContentLoaded", init);
 
@@ -109,9 +114,6 @@
     bind();
     if (window.lucide?.createIcons) window.lucide.createIcons();
     fillLanguages();
-    const lastUser = localStorage.getItem(LAST_USER_KEY);
-    if (lastUser && els.loginName) els.loginName.value = lastUser;
-    if (els.loginPassword && !els.loginPassword.value) els.loginPassword.value = "Login";
     if (setupFirebase()) {
       void bootstrapFirebaseAuth();
       return;
@@ -126,7 +128,8 @@
 
   function cache() {
     [
-      "loginView", "appView", "loginForm", "loginName", "loginPassword", "loginError", "registerButton",
+      "loginView", "adminView", "appView", "loginForm", "loginName", "loginPassword", "loginError", "registerButton",
+      "adminRefreshButton", "adminLogoutButton", "adminStatus", "adminAccountList",
       "breadcrumb", "boardTitle", "backButton", "homeButton", "logoutButton", "helpButton", "shortcutHelp", "boardFrame", "world", "frameLayer", "linkLayer", "nodeLayer", "linkOverlay",
       "marquee", "modeHint", "handTool", "selectTool", "cardTool", "textTool",
       "frameTool", "emojiTool", "emojiPicker", "emojiSearch", "emojiGrid",
@@ -148,6 +151,14 @@
   function bind() {
     els.loginForm.addEventListener("submit", login);
     els.registerButton?.addEventListener("click", registerAccount);
+    els.adminRefreshButton?.addEventListener("click", () => {
+      void refreshAdminAccounts();
+    });
+    els.adminLogoutButton?.addEventListener("click", () => {
+      clearAuthSession();
+      showLogin();
+    });
+    els.adminAccountList?.addEventListener("click", onAdminAccountAction);
     els.logoutButton.addEventListener("click", () => {
       clearAuthSession();
       showLogin();
@@ -569,6 +580,18 @@
     return `${slug || "user"}@bible-study-board.local`;
   }
 
+  function isAdminUsername(username) {
+    return normalizeUsername(username) === normalizeUsername(ADMIN_LOGIN);
+  }
+
+  function isAdminCredentials(username, password) {
+    return isAdminUsername(username) && String(password || "") === ADMIN_PASSWORD;
+  }
+
+  function isAdminSession() {
+    return isAdminUsername(currentUser) || isAdminUsername(authSession?.username || authSession?.displayName || "");
+  }
+
   function normalizeAuthPassword(password) {
     const value = String(password || "");
     return value.length >= 6 ? value : value.padEnd(6, "!");
@@ -592,16 +615,7 @@
         return;
       }
       try {
-        migrateLocalCacheToUid();
-        const remoteState = await loadRemoteStateForCurrentUser();
-        if (remoteState) state = remoteState;
-        else {
-          state = loadState();
-          await persistRemoteState(true);
-        }
-        localStorage.setItem(storageKeyForUser(), JSON.stringify(compactStateForStorage(state)));
-        initHistory();
-        showApp();
+        await finalizeSignedInSession();
       } catch (error) {
         console.warn("Could not restore the signed-in Firebase session.", error);
         clearAuthSession();
@@ -655,6 +669,7 @@
     authSession = null;
     currentUserUid = "";
     currentUser = "";
+    adminAccounts = [];
     localStorage.removeItem(AUTH_SESSION_KEY);
     sessionStorage.removeItem(SESSION_KEY);
   }
@@ -667,8 +682,12 @@
     return `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(FIREBASE_CONFIG.apiKey)}`;
   }
 
-  function firestoreDocumentEndpoint(userId) {
-    return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_CONFIG.projectId)}/databases/(default)/documents/${FIREBASE_BOARD_COLLECTION}/${encodeURIComponent(userId)}`;
+  function firestoreDocumentEndpoint(collection, documentId) {
+    return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_CONFIG.projectId)}/databases/(default)/documents/${collection}/${encodeURIComponent(documentId)}`;
+  }
+
+  function firestoreCollectionEndpoint(collection, query = "") {
+    return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_CONFIG.projectId)}/databases/(default)/documents/${collection}${query ? `?${query}` : ""}`;
   }
 
   async function firebaseAuthRequest(method, payload, contentType = "application/json") {
@@ -791,11 +810,88 @@
         Authorization: `Bearer ${token}`,
       },
     });
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
       clearAuthSession();
       throw { code: "auth/session-expired", response };
     }
+    if (response.status === 403) throw { code: "firestore/forbidden", response };
     return response;
+  }
+
+  function firestoreString(doc, field) {
+    return doc?.fields?.[field]?.stringValue || "";
+  }
+
+  function firestoreTimestamp(doc, field) {
+    return doc?.fields?.[field]?.timestampValue || "";
+  }
+
+  async function listFirestoreCollection(collection, pageSize = 250) {
+    const response = await authorizedFirestoreRequest(firestoreCollectionEndpoint(collection, `pageSize=${pageSize}`), { method: "GET" });
+    if (response.status === 404) return [];
+    const payload = await response.json().catch(() => ({}));
+    return Array.isArray(payload?.documents) ? payload.documents : [];
+  }
+
+  async function persistUserProfile() {
+    if (!firebaseReady || !currentUserUid || !currentUser) return false;
+    await authorizedFirestoreRequest(firestoreDocumentEndpoint(FIREBASE_PROFILE_COLLECTION, currentUserUid), {
+      method: "PATCH",
+      body: JSON.stringify({
+        fields: {
+          uid: { stringValue: currentUserUid },
+          username: { stringValue: currentUser },
+          email: { stringValue: authSession?.email || usernameToEmail(currentUser) },
+          updatedAt: { timestampValue: new Date().toISOString() },
+        },
+      }),
+    });
+    return true;
+  }
+
+  async function loadBlockedUserRecord(userId = currentUserUid) {
+    if (!firebaseReady || !userId) return null;
+    try {
+      const response = await authorizedFirestoreRequest(firestoreDocumentEndpoint(FIREBASE_BLOCKED_COLLECTION, userId), { method: "GET" });
+      if (response.status === 404) return null;
+      return await response.json().catch(() => null);
+    } catch (error) {
+      if (error?.response?.status === 404) return null;
+      throw error;
+    }
+  }
+
+  async function ensureAccountAllowed() {
+    if (!firebaseReady || !currentUserUid || isAdminSession()) return true;
+    const blockedDoc = await loadBlockedUserRecord(currentUserUid);
+    if (!blockedDoc) return true;
+    clearAuthSession();
+    state = createSeedState();
+    initHistory();
+    showLogin("This account has been blocked.");
+    return false;
+  }
+
+  async function finalizeSignedInSession() {
+    await persistUserProfile().catch((error) => {
+      console.warn("Could not save the user profile.", error);
+    });
+    if (!(await ensureAccountAllowed())) return false;
+    if (isAdminSession()) {
+      showAdmin();
+      return true;
+    }
+    migrateLocalCacheToUid();
+    const remoteState = await loadRemoteStateForCurrentUser();
+    if (remoteState) state = remoteState;
+    else {
+      state = loadState();
+      await persistRemoteState(true);
+    }
+    localStorage.setItem(storageKeyForUser(), JSON.stringify(compactStateForStorage(state)));
+    initHistory();
+    showApp();
+    return true;
   }
 
   function firestoreFieldsFromBoardState(source) {
@@ -857,7 +953,7 @@
   async function loadRemoteStateForCurrentUser() {
     if (!firebaseReady || !currentUserUid) return null;
     try {
-      const response = await authorizedFirestoreRequest(firestoreDocumentEndpoint(currentUserUid), { method: "GET" });
+      const response = await authorizedFirestoreRequest(firestoreDocumentEndpoint(FIREBASE_BOARD_COLLECTION, currentUserUid), { method: "GET" });
       if (response.status === 404) return null;
       const doc = await response.json();
       const rawState = doc?.fields?.stateJson?.stringValue;
@@ -890,7 +986,7 @@
     remoteSavePromise = remoteSavePromise
       .catch(() => null)
       .then(async () => {
-        await authorizedFirestoreRequest(firestoreDocumentEndpoint(currentUserUid), {
+        await authorizedFirestoreRequest(firestoreDocumentEndpoint(FIREBASE_BOARD_COLLECTION, currentUserUid), {
           method: "PATCH",
           body: JSON.stringify({ fields: firestoreFieldsFromBoardState(state) }),
         });
@@ -903,6 +999,17 @@
     return true;
   }
 
+  async function signInOrProvisionAdmin(username, password) {
+    try {
+      return await signInWithFirebaseRest(username, password);
+    } catch (error) {
+      if (isAdminCredentials(username, password) && error?.code === "auth/invalid-credential") {
+        return registerWithFirebaseRest(username, password);
+      }
+      throw error;
+    }
+  }
+
   function login(event) {
     event?.preventDefault?.();
     const username = els.loginName.value.trim();
@@ -913,18 +1020,9 @@
         return;
       }
       els.loginError.textContent = "";
-      signInWithFirebaseRest(username, password)
+      signInOrProvisionAdmin(username, password)
         .then(async () => {
-          migrateLocalCacheToUid();
-          const remoteState = await loadRemoteStateForCurrentUser();
-          if (remoteState) state = remoteState;
-          else {
-            state = loadState();
-            await persistRemoteState(true);
-          }
-          localStorage.setItem(storageKeyForUser(), JSON.stringify(compactStateForStorage(state)));
-          initHistory();
-          showApp();
+          await finalizeSignedInSession();
         })
         .catch((error) => {
           els.loginError.textContent = mapFirebaseAuthError(error, "Wrong login or password.");
@@ -962,11 +1060,7 @@
       els.loginError.textContent = "";
       registerWithFirebaseRest(username, password)
         .then(async () => {
-          state = loadState();
-          await persistRemoteState(true);
-          localStorage.setItem(storageKeyForUser(), JSON.stringify(compactStateForStorage(state)));
-          initHistory();
-          showApp();
+          await finalizeSignedInSession();
         })
         .catch((error) => {
           els.loginError.textContent = mapFirebaseAuthError(error, "Could not create this account.");
@@ -998,14 +1092,25 @@
     showApp();
   }
 
-  function showLogin() {
+  function showLogin(message = "") {
     els.loginView.hidden = false;
+    if (els.adminView) els.adminView.hidden = true;
     els.appView.hidden = true;
-    els.loginError.textContent = "";
+    els.loginError.textContent = message;
+    if (els.loginName) els.loginName.value = "";
+    if (els.loginPassword) els.loginPassword.value = "";
+  }
+
+  function showAdmin() {
+    els.loginView.hidden = true;
+    if (els.adminView) els.adminView.hidden = false;
+    els.appView.hidden = true;
+    void refreshAdminAccounts();
   }
 
   function showApp() {
     els.loginView.hidden = true;
+    if (els.adminView) els.adminView.hidden = true;
     els.appView.hidden = false;
     els.appView.classList.toggle("bible-open", !els.biblePanel.hidden);
     renderAll();
@@ -1015,6 +1120,180 @@
       else applyViewport();
       scheduleLinkRefresh();
     });
+  }
+
+  function escapeHtml(value) {
+    return String(value || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function formatAdminDate(value) {
+    if (!value) return "Never";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "Unknown";
+    return date.toLocaleString();
+  }
+
+  async function refreshAdminAccounts() {
+    if (!els.adminAccountList || !firebaseReady || !isAdminSession()) return;
+    els.adminStatus.textContent = "Loading accounts...";
+    try {
+      const [profileDocs, boardDocs, blockedDocs] = await Promise.all([
+        listFirestoreCollection(FIREBASE_PROFILE_COLLECTION, 300),
+        listFirestoreCollection(FIREBASE_BOARD_COLLECTION, 300),
+        listFirestoreCollection(FIREBASE_BLOCKED_COLLECTION, 300).catch((error) => {
+          console.warn("Could not load blocked users.", error);
+          return [];
+        }),
+      ]);
+      const map = new Map();
+      profileDocs.forEach((doc) => {
+        const uid = firestoreString(doc, "uid") || doc.name?.split("/").pop() || "";
+        if (!uid) return;
+        map.set(uid, {
+          uid,
+          username: firestoreString(doc, "username") || uid,
+          email: firestoreString(doc, "email"),
+          profileUpdatedAt: firestoreTimestamp(doc, "updatedAt"),
+          boardUpdatedAt: "",
+          blocked: false,
+          blockedAt: "",
+        });
+      });
+      boardDocs.forEach((doc) => {
+        const uid = firestoreString(doc, "uid") || doc.name?.split("/").pop() || "";
+        if (!uid) return;
+        const entry = map.get(uid) || {
+          uid,
+          username: firestoreString(doc, "username") || uid,
+          email: "",
+          profileUpdatedAt: "",
+          boardUpdatedAt: "",
+          blocked: false,
+          blockedAt: "",
+        };
+        entry.username = entry.username || firestoreString(doc, "username") || uid;
+        entry.boardUpdatedAt = firestoreTimestamp(doc, "updatedAt");
+        map.set(uid, entry);
+      });
+      blockedDocs.forEach((doc) => {
+        const uid = firestoreString(doc, "uid") || doc.name?.split("/").pop() || "";
+        if (!uid) return;
+        const entry = map.get(uid) || {
+          uid,
+          username: firestoreString(doc, "username") || uid,
+          email: "",
+          profileUpdatedAt: "",
+          boardUpdatedAt: "",
+          blocked: false,
+          blockedAt: "",
+        };
+        entry.username = entry.username || firestoreString(doc, "username") || uid;
+        entry.blocked = true;
+        entry.blockedAt = firestoreTimestamp(doc, "blockedAt");
+        map.set(uid, entry);
+      });
+      adminAccounts = [...map.values()].sort((a, b) => {
+        const left = String(a.username || a.uid).toLowerCase();
+        const right = String(b.username || b.uid).toLowerCase();
+        return left.localeCompare(right);
+      });
+      renderAdminAccounts();
+      els.adminStatus.textContent = adminAccounts.length ? `${adminAccounts.length} account${adminAccounts.length === 1 ? "" : "s"}` : "No accounts yet.";
+    } catch (error) {
+      console.warn("Could not load admin accounts.", error);
+      els.adminStatus.textContent = "Could not load accounts. Firestore admin rules may still need updating.";
+      els.adminAccountList.innerHTML = "";
+    }
+  }
+
+  function renderAdminAccounts() {
+    if (!els.adminAccountList) return;
+    if (!adminAccounts.length) {
+      els.adminAccountList.innerHTML = "";
+      return;
+    }
+    els.adminAccountList.innerHTML = adminAccounts.map((account) => {
+      const username = escapeHtml(account.username || "Unknown");
+      const uid = escapeHtml(account.uid);
+      const email = escapeHtml(account.email || "No email saved");
+      const boardUpdated = escapeHtml(formatAdminDate(account.boardUpdatedAt || account.profileUpdatedAt));
+      const blockedAt = account.blocked ? `<span class="admin-badge blocked">Blocked ${escapeHtml(formatAdminDate(account.blockedAt))}</span>` : `<span class="admin-badge">Active</span>`;
+      const nextAction = account.blocked ? "Unblock" : "Block";
+      return `
+        <article class="admin-account">
+          <div class="admin-account-head">
+            <div>
+              <h3>${username}</h3>
+              <div class="admin-account-meta">
+                <span>${uid}</span>
+                <span>${email}</span>
+                <span>Last board save: ${boardUpdated}</span>
+              </div>
+            </div>
+            <div class="admin-badges">${blockedAt}</div>
+          </div>
+          <div class="admin-actions">
+            <button class="ghost-button" type="button" data-action="delete-board" data-uid="${uid}">Delete board data</button>
+            <button class="ghost-button" type="button" data-action="${account.blocked ? "unblock" : "block"}" data-uid="${uid}">${nextAction}</button>
+          </div>
+        </article>
+      `;
+    }).join("");
+  }
+
+  async function deleteAdminBoardData(uid) {
+    const response = await authorizedFirestoreRequest(firestoreDocumentEndpoint(FIREBASE_BOARD_COLLECTION, uid), { method: "DELETE" });
+    return response.ok || response.status === 404;
+  }
+
+  async function setBlockedState(uid, username, blocked) {
+    if (blocked) {
+      await authorizedFirestoreRequest(firestoreDocumentEndpoint(FIREBASE_BLOCKED_COLLECTION, uid), {
+        method: "PATCH",
+        body: JSON.stringify({
+          fields: {
+            uid: { stringValue: uid },
+            username: { stringValue: username || uid },
+            blockedAt: { timestampValue: new Date().toISOString() },
+          },
+        }),
+      });
+      return true;
+    }
+    const response = await authorizedFirestoreRequest(firestoreDocumentEndpoint(FIREBASE_BLOCKED_COLLECTION, uid), { method: "DELETE" });
+    return response.ok || response.status === 404;
+  }
+
+  async function onAdminAccountAction(event) {
+    const button = event.target.closest("button[data-action]");
+    if (!button) return;
+    const uid = button.dataset.uid || "";
+    const username = adminAccounts.find((account) => account.uid === uid)?.username || uid;
+    const action = button.dataset.action || "";
+    if (!uid) return;
+    button.disabled = true;
+    try {
+      if (action === "delete-board") {
+        if (!window.confirm(`Delete saved board data for ${username}?`)) return;
+        await deleteAdminBoardData(uid);
+      } else if (action === "block") {
+        if (!window.confirm(`Block ${username} from signing in?`)) return;
+        await setBlockedState(uid, username, true);
+      } else if (action === "unblock") {
+        await setBlockedState(uid, username, false);
+      }
+      await refreshAdminAccounts();
+    } catch (error) {
+      console.warn("Admin action failed.", error);
+      els.adminStatus.textContent = "Could not update this account.";
+    } finally {
+      button.disabled = false;
+    }
   }
 
   function mapFirebaseAuthError(error, fallback) {
