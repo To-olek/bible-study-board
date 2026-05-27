@@ -2,7 +2,18 @@
   const STORAGE_KEY = "bible-study-board-state-v3";
   const SESSION_KEY = "bible-study-board-session-v1";
   const LAST_USER_KEY = "bible-study-board-last-user-v1";
+  const AUTH_SESSION_KEY = "bible-study-board-auth-session-v1";
   const USERS_KEY = "bible-study-board-users-v1";
+  const FIREBASE_BOARD_COLLECTION = "userBoards";
+  const FIREBASE_SDK_VERSION = "12.13.0";
+  const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyCI4tHyGeqt1-SZhoV7v7PlyN7eBk48luw",
+    authDomain: "bible-study-board.firebaseapp.com",
+    projectId: "bible-study-board",
+    storageBucket: "bible-study-board.firebasestorage.app",
+    messagingSenderId: "839849807005",
+    appId: "1:839849807005:web:6aaa52cd984738186c1874",
+  };
   const IMAGE_DB_NAME = "bible-study-board-images-v1";
   const IMAGE_STORE_NAME = "images";
   const WORLD_SIZE = 32000;
@@ -79,25 +90,38 @@
   let lastHistorySnapshot = "";
   let restoringHistory = false;
   let currentUser = "";
+  let currentUserUid = "";
+  let firebaseReady = false;
+  let authSession = null;
+  let remoteSaveTimer = 0;
+  let authBootPromise = null;
+  let remoteSavePromise = Promise.resolve();
+  let applyingRemoteState = false;
+  let imageBootPromise = null;
 
   document.addEventListener("DOMContentLoaded", init);
 
   function init() {
-    currentUser = sessionStorage.getItem(SESSION_KEY) || "";
     cache();
-    ensureDemoAuthSeed();
     window.BIBLE_PACKS ||= {};
-    state = loadState();
+    state = createSeedState();
     fillFontSizeOptions();
     bind();
-    initHistory();
     if (window.lucide?.createIcons) window.lucide.createIcons();
     fillLanguages();
     const lastUser = localStorage.getItem(LAST_USER_KEY);
-    if (lastUser && els.loginName && !currentUser) els.loginName.value = lastUser;
+    if (lastUser && els.loginName) els.loginName.value = lastUser;
+    if (els.loginPassword && !els.loginPassword.value) els.loginPassword.value = "Login";
+    if (setupFirebase()) {
+      void bootstrapFirebaseAuth();
+      return;
+    }
+    currentUser = sessionStorage.getItem(SESSION_KEY) || "";
+    ensureDemoAuthSeed();
+    state = loadState();
+    initHistory();
     if (currentUser) showApp();
     else showLogin();
-    void bootImageStorage();
   }
 
   function cache() {
@@ -125,8 +149,7 @@
     els.loginForm.addEventListener("submit", login);
     els.registerButton?.addEventListener("click", registerAccount);
     els.logoutButton.addEventListener("click", () => {
-      sessionStorage.removeItem(SESSION_KEY);
-      currentUser = "";
+      clearAuthSession();
       showLogin();
     });
 
@@ -532,6 +555,258 @@
     return String(value || "").trim().toLowerCase();
   }
 
+  function sanitizeLoginSlug(value) {
+    return normalizeUsername(value)
+      .normalize("NFKD")
+      .replace(/[^\w.-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 60);
+  }
+
+  function usernameToEmail(username) {
+    const slug = sanitizeLoginSlug(username);
+    return `${slug || "user"}@bible-study-board.local`;
+  }
+
+  function normalizeAuthPassword(password) {
+    const value = String(password || "");
+    return value.length >= 6 ? value : value.padEnd(6, "!");
+  }
+
+  function setupFirebase() {
+    firebaseReady = Boolean(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId);
+    return firebaseReady;
+  }
+
+  function bootstrapFirebaseAuth() {
+    if (!firebaseReady) return Promise.resolve();
+    if (authBootPromise) return authBootPromise;
+    authBootPromise = (async () => {
+      clearTimeout(remoteSaveTimer);
+      const restored = restoreAuthSession();
+      if (!restored) {
+        state = createSeedState();
+        initHistory();
+        showLogin();
+        return;
+      }
+      try {
+        migrateLocalCacheToUid();
+        const remoteState = await loadRemoteStateForCurrentUser();
+        if (remoteState) state = remoteState;
+        else {
+          state = loadState();
+          await persistRemoteState(true);
+        }
+        localStorage.setItem(storageKeyForUser(), JSON.stringify(compactStateForStorage(state)));
+        initHistory();
+        showApp();
+      } catch (error) {
+        console.warn("Could not restore the signed-in Firebase session.", error);
+        clearAuthSession();
+        state = createSeedState();
+        initHistory();
+        showLogin();
+      }
+    });
+    return authBootPromise;
+  }
+
+  function deriveUsernameFromUser(user) {
+    if (!user) return "";
+    if (user.displayName) return user.displayName;
+    const email = String(user.email || "");
+    if (email.endsWith("@bible-study-board.local")) return email.replace(/@bible-study-board\.local$/i, "");
+    return email;
+  }
+
+  function restoreAuthSession() {
+    if (!firebaseReady) return null;
+    try {
+      const raw = localStorage.getItem(AUTH_SESSION_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed?.idToken || !parsed?.uid) return null;
+      authSession = parsed;
+      currentUserUid = parsed.uid;
+      currentUser = parsed.username || parsed.displayName || parsed.email?.replace(/@bible-study-board\.local$/i, "") || "";
+      if (currentUser) localStorage.setItem(LAST_USER_KEY, currentUser);
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function persistAuthSession(session) {
+    authSession = {
+      ...session,
+      username: session.username || deriveUsernameFromUser(session),
+      expiresAt: Number(session.expiresAt || 0),
+    };
+    currentUserUid = authSession.uid || "";
+    currentUser = authSession.username || "";
+    localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(authSession));
+    if (currentUser) localStorage.setItem(LAST_USER_KEY, currentUser);
+  }
+
+  function clearAuthSession() {
+    clearTimeout(remoteSaveTimer);
+    authSession = null;
+    currentUserUid = "";
+    currentUser = "";
+    localStorage.removeItem(AUTH_SESSION_KEY);
+    sessionStorage.removeItem(SESSION_KEY);
+  }
+
+  function firebaseAuthEndpoint(method) {
+    return `https://identitytoolkit.googleapis.com/v1/${method}?key=${encodeURIComponent(FIREBASE_CONFIG.apiKey)}`;
+  }
+
+  function firebaseTokenRefreshEndpoint() {
+    return `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(FIREBASE_CONFIG.apiKey)}`;
+  }
+
+  function firestoreDocumentEndpoint(userId) {
+    return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_CONFIG.projectId)}/databases/(default)/documents/${FIREBASE_BOARD_COLLECTION}/${encodeURIComponent(userId)}`;
+  }
+
+  async function firebaseAuthRequest(method, payload, contentType = "application/json") {
+    const response = await fetch(firebaseAuthEndpoint(method), {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body: contentType === "application/json" ? JSON.stringify(payload) : payload,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const code = mapFirebaseRestError(data?.error?.message);
+      throw { code, rawCode: data?.error?.message || "", data };
+    }
+    return data;
+  }
+
+  function mapFirebaseRestError(message) {
+    const code = String(message || "").toUpperCase();
+    if (code.includes("EMAIL_EXISTS")) return "auth/email-already-in-use";
+    if (code.includes("WEAK_PASSWORD")) return "auth/weak-password";
+    if (code.includes("INVALID_PASSWORD") || code.includes("EMAIL_NOT_FOUND") || code.includes("INVALID_LOGIN_CREDENTIALS") || code.includes("INVALID_EMAIL")) return "auth/invalid-credential";
+    if (code.includes("TOO_MANY_ATTEMPTS_TRY_LATER")) return "auth/too-many-requests";
+    if (code.includes("TOKEN_EXPIRED") || code.includes("INVALID_ID_TOKEN") || code.includes("CREDENTIAL_TOO_OLD_LOGIN_AGAIN")) return "auth/session-expired";
+    return code ? `auth/${code.toLowerCase()}` : "auth/unknown";
+  }
+
+  async function signInWithFirebaseRest(username, password) {
+    const email = usernameToEmail(username);
+    const data = await firebaseAuthRequest("accounts:signInWithPassword", {
+      email,
+      password: normalizeAuthPassword(password),
+      returnSecureToken: true,
+    });
+    persistAuthSession({
+      uid: data.localId,
+      email: data.email,
+      username,
+      displayName: data.displayName || username,
+      idToken: data.idToken,
+      refreshToken: data.refreshToken,
+      expiresAt: Date.now() + Number(data.expiresIn || 3600) * 1000,
+    });
+    return data;
+  }
+
+  async function registerWithFirebaseRest(username, password) {
+    const email = usernameToEmail(username);
+    const data = await firebaseAuthRequest("accounts:signUp", {
+      email,
+      password: normalizeAuthPassword(password),
+      returnSecureToken: true,
+    });
+    let displayName = username;
+    try {
+      const profile = await firebaseAuthRequest("accounts:update", {
+        idToken: data.idToken,
+        displayName: username,
+        returnSecureToken: true,
+      });
+      displayName = profile.displayName || username;
+      data.idToken = profile.idToken || data.idToken;
+      data.refreshToken = profile.refreshToken || data.refreshToken;
+      data.expiresIn = profile.expiresIn || data.expiresIn;
+    } catch (error) {
+      console.warn("Could not update Firebase profile display name.", error);
+    }
+    persistAuthSession({
+      uid: data.localId,
+      email: data.email,
+      username,
+      displayName,
+      idToken: data.idToken,
+      refreshToken: data.refreshToken,
+      expiresAt: Date.now() + Number(data.expiresIn || 3600) * 1000,
+    });
+    return data;
+  }
+
+  async function ensureValidIdToken() {
+    if (!authSession?.idToken) return "";
+    if (authSession.expiresAt && authSession.expiresAt - Date.now() > 60_000) return authSession.idToken;
+    if (!authSession.refreshToken) {
+      clearAuthSession();
+      throw { code: "auth/session-expired" };
+    }
+    const payload = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: authSession.refreshToken,
+    });
+    const response = await fetch(firebaseTokenRefreshEndpoint(), {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: payload.toString(),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      clearAuthSession();
+      throw { code: mapFirebaseRestError(data?.error?.message || data?.error || "TOKEN_EXPIRED") };
+    }
+    persistAuthSession({
+      uid: data.user_id || authSession.uid,
+      email: authSession.email || `${sanitizeLoginSlug(authSession.username || currentUser) || "user"}@bible-study-board.local`,
+      username: authSession.username || currentUser || "Login",
+      displayName: authSession.displayName || currentUser || "Login",
+      idToken: data.id_token,
+      refreshToken: data.refresh_token,
+      expiresAt: Date.now() + Number(data.expires_in || 3600) * 1000,
+    });
+    return authSession.idToken;
+  }
+
+  async function authorizedFirestoreRequest(url, options = {}) {
+    const token = await ensureValidIdToken();
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        Accept: "application/json",
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(options.headers || {}),
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    if (response.status === 401 || response.status === 403) {
+      clearAuthSession();
+      throw { code: "auth/session-expired", response };
+    }
+    return response;
+  }
+
+  function firestoreFieldsFromBoardState(source) {
+    return {
+      uid: { stringValue: currentUserUid },
+      username: { stringValue: currentUser || "" },
+      updatedAt: { timestampValue: new Date().toISOString() },
+      stateJson: { stringValue: JSON.stringify(fullStateForRemoteStorage(source)) },
+    };
+  }
+
   function loadUsers() {
     try {
       const raw = localStorage.getItem(USERS_KEY);
@@ -559,14 +834,103 @@
   }
 
   function storageKeyForUser(username = currentUser) {
+    if (currentUserUid) return `${STORAGE_KEY}:uid:${currentUserUid}`;
     const normalized = normalizeUsername(username);
     return normalized ? `${STORAGE_KEY}:${normalized}` : STORAGE_KEY;
   }
 
+  function legacyStorageKeyForUser(username = currentUser) {
+    const normalized = normalizeUsername(username);
+    return normalized ? `${STORAGE_KEY}:${normalized}` : STORAGE_KEY;
+  }
+
+  function migrateLocalCacheToUid() {
+    if (!currentUserUid || !currentUser) return;
+    const nextKey = storageKeyForUser(currentUser);
+    const legacyKey = legacyStorageKeyForUser(currentUser);
+    if (nextKey === legacyKey) return;
+    const existing = localStorage.getItem(nextKey);
+    const legacy = localStorage.getItem(legacyKey);
+    if (!existing && legacy) localStorage.setItem(nextKey, legacy);
+  }
+
+  async function loadRemoteStateForCurrentUser() {
+    if (!firebaseReady || !currentUserUid) return null;
+    try {
+      const response = await authorizedFirestoreRequest(firestoreDocumentEndpoint(currentUserUid), { method: "GET" });
+      if (response.status === 404) return null;
+      const doc = await response.json();
+      const rawState = doc?.fields?.stateJson?.stringValue;
+      if (!rawState) return null;
+      applyingRemoteState = true;
+      return normalize(JSON.parse(rawState));
+    } catch (error) {
+      console.warn("Could not load the remote board state.", error);
+      return null;
+    } finally {
+      applyingRemoteState = false;
+    }
+  }
+
+  function fullStateForRemoteStorage(source) {
+    return JSON.parse(JSON.stringify(source));
+  }
+
+  function queueRemoteSave() {
+    if (!firebaseReady || !currentUserUid || applyingRemoteState) return;
+    clearTimeout(remoteSaveTimer);
+    remoteSaveTimer = window.setTimeout(() => {
+      void persistRemoteState();
+    }, 900);
+  }
+
+  async function persistRemoteState(force = false) {
+    if (!firebaseReady || !currentUserUid || !state) return false;
+    if (!force && applyingRemoteState) return false;
+    remoteSavePromise = remoteSavePromise
+      .catch(() => null)
+      .then(async () => {
+        await authorizedFirestoreRequest(firestoreDocumentEndpoint(currentUserUid), {
+          method: "PATCH",
+          body: JSON.stringify({ fields: firestoreFieldsFromBoardState(state) }),
+        });
+      })
+      .catch((error) => {
+        console.warn("Could not save the remote board state.", error);
+        return null;
+      });
+    await remoteSavePromise;
+    return true;
+  }
+
   function login(event) {
-    event.preventDefault();
+    event?.preventDefault?.();
     const username = els.loginName.value.trim();
     const password = els.loginPassword.value;
+    if (firebaseReady) {
+      if (!username || !password) {
+        els.loginError.textContent = "Enter login and password.";
+        return;
+      }
+      els.loginError.textContent = "";
+      signInWithFirebaseRest(username, password)
+        .then(async () => {
+          migrateLocalCacheToUid();
+          const remoteState = await loadRemoteStateForCurrentUser();
+          if (remoteState) state = remoteState;
+          else {
+            state = loadState();
+            await persistRemoteState(true);
+          }
+          localStorage.setItem(storageKeyForUser(), JSON.stringify(compactStateForStorage(state)));
+          initHistory();
+          showApp();
+        })
+        .catch((error) => {
+          els.loginError.textContent = mapFirebaseAuthError(error, "Wrong login or password.");
+        });
+      return;
+    }
     const normalized = normalizeUsername(username);
     const users = loadUsers();
     const account = users[normalized];
@@ -582,12 +946,33 @@
     sessionStorage.setItem(SESSION_KEY, currentUser);
     localStorage.setItem(LAST_USER_KEY, currentUser);
     els.loginError.textContent = "";
+    state = loadState();
+    initHistory();
     showApp();
   }
 
   function registerAccount() {
     const username = els.loginName.value.trim();
     const password = els.loginPassword.value;
+    if (firebaseReady) {
+      if (!username || !password) {
+        els.loginError.textContent = "Enter login and password to register.";
+        return;
+      }
+      els.loginError.textContent = "";
+      registerWithFirebaseRest(username, password)
+        .then(async () => {
+          state = loadState();
+          await persistRemoteState(true);
+          localStorage.setItem(storageKeyForUser(), JSON.stringify(compactStateForStorage(state)));
+          initHistory();
+          showApp();
+        })
+        .catch((error) => {
+          els.loginError.textContent = mapFirebaseAuthError(error, "Could not create this account.");
+        });
+      return;
+    }
     const normalized = normalizeUsername(username);
     const users = loadUsers();
     if (!normalized || !password) {
@@ -608,6 +993,8 @@
     sessionStorage.setItem(SESSION_KEY, currentUser);
     localStorage.setItem(LAST_USER_KEY, currentUser);
     els.loginError.textContent = "";
+    state = loadState();
+    initHistory();
     showApp();
   }
 
@@ -615,24 +1002,28 @@
     els.loginView.hidden = false;
     els.appView.hidden = true;
     els.loginError.textContent = "";
-    if (els.loginPassword) els.loginPassword.value = "";
   }
 
   function showApp() {
-    state = loadState();
-    initHistory();
     els.loginView.hidden = true;
     els.appView.hidden = false;
     els.appView.classList.toggle("bible-open", !els.biblePanel.hidden);
     renderAll();
-    void hydrateStateImages().then((changed) => {
-      if (changed) renderAll();
-    });
+    void bootImageStorage();
     requestAnimationFrame(() => {
       if (!currentBoard().viewport) fitBoard();
       else applyViewport();
       scheduleLinkRefresh();
     });
+  }
+
+  function mapFirebaseAuthError(error, fallback) {
+    const code = String(error?.code || "");
+    if (code === "auth/email-already-in-use") return "This login already exists.";
+    if (code === "auth/weak-password") return "Password is too short.";
+    if (code === "auth/invalid-email" || code === "auth/invalid-credential" || code === "auth/user-not-found" || code === "auth/wrong-password" || code === "auth/invalid-login-credentials") return "Wrong login or password.";
+    if (code === "auth/too-many-requests") return "Too many attempts. Try again later.";
+    return fallback;
   }
 
   function loadState() {
@@ -793,6 +1184,7 @@
     }
     try {
       localStorage.setItem(storageKeyForUser(), serialized);
+      queueRemoteSave();
       return true;
     } catch (error) {
       if (!isQuotaExceededError(error)) throw error;
@@ -801,6 +1193,7 @@
       } catch (fallbackError) {
         console.warn("Could not persist the current board snapshot locally.", fallbackError);
       }
+      queueRemoteSave();
       console.warn("Could not fully persist the current board snapshot locally.");
       return false;
     }
@@ -817,9 +1210,15 @@
   }
 
   async function bootImageStorage() {
-    await migrateEmbeddedImages();
-    const changed = await hydrateStateImages();
-    if (changed) renderAll();
+    if (imageBootPromise) return imageBootPromise;
+    imageBootPromise = (async () => {
+      await migrateEmbeddedImages();
+      const changed = await hydrateStateImages();
+      if (changed) renderAll();
+    })().finally(() => {
+      imageBootPromise = null;
+    });
+    return imageBootPromise;
   }
 
   function openImageDb() {
@@ -2570,9 +2969,8 @@
       viewport = board?.viewport ? { ...board.viewport } : { x: 0, y: 0, zoom: 1 };
       localStorage.setItem(storageKeyForUser(), serialized);
       renderAll();
-      void hydrateStateImages().then((changed) => {
-        if (changed) renderAll();
-      });
+      void bootImageStorage();
+      queueRemoteSave();
     } finally {
       restoringHistory = false;
     }
